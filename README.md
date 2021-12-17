@@ -1,6 +1,6 @@
 # Mockingjay
 
-Source code for the Mockingjay cache replacement policy. The policy can be run in the [ChampSim](https://github.com/ChampSim/ChampSim) simulator.
+Source code for the Mockingjay cache replacement policy. The policy can be run in the [ChampSim](https://github.com/ChampSim/ChampSim) simulator. Email ishan@cs.utexas.edu for any questions or concerns.
 
 ## TODO
 
