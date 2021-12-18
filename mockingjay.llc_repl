@@ -5,29 +5,35 @@
 #include <stdlib.h>
 using namespace std;
 
-#define bitmask(l) (((l) == 64) ? (unsigned long long)(-1LL) : ((1LL << (l))-1LL))
-#define bits(x, i, l) (((x) >> (i)) & bitmask(l))
-#define SAMPLED_SET(set) (bits(set, 0 , 6) == bits(set, ((unsigned long long)log2(LLC_SET) - 6), 6) ) 
+constexpr int LOG2_LLC_SIZE = log2(LLC_SET) + log2(LLC_WAY) + LOG2_BLOCK_SIZE;
+//constexpr int LOG2_SAMPLED_SETS = log2(LLC_SET) - 6;
+constexpr int LOG2_SAMPLED_SETS = LOG2_LLC_SIZE - 16;
 
+bool SAMPLED_SET(int set) {
+    int mask_length = log2(LLC_SET)-LOG2_SAMPLED_SETS;
+    int mask = (1 << mask_length) - 1;
+    return (set & mask) == ((set >> ((int)log2(LLC_SET) - mask_length)) & mask);
+}
 
 constexpr int SAMPLED_WAYS = 5;
-constexpr int SAMPLED_CACHE_SETS_LOG = 11 - 7;
+constexpr int SAMPLED_CACHE_SETS_LOG = 4;
 
 constexpr int TIMESTAMP_BITS = 8;
 
 
 constexpr int HISTORY = 8;
 constexpr int GRANULARITY = 8;
-constexpr int BLOCK_ADDR_HASH = 12;
-constexpr int PC_HASH = 13;
+constexpr int BLOCK_ADDR_HASH = 31 - LOG2_LLC_SIZE;
+//constexpr int PC_HASH = log2(LLC_SET);
+constexpr int PC_HASH = LOG2_LLC_SIZE - 10;
 
 constexpr int TEMP_NUM = 1;
 constexpr int TEMP_DEN = 16;
 
-constexpr int FLEXMIN_PENALTY_NUM = 3;
-constexpr int FLEXMIN_PENALTY_DEN = 2;
+constexpr int FLEXMIN_PENALTY_NUM = 2;
+constexpr int FLEXMIN_PENALTY_DEN = 1;
+constexpr double FLEXMIN_PENALTY = 2.0 - log2(NUM_CPUS)/4.0;
 
-constexpr int SAMPLE_SIZE = 32 * NUM_CPUS;
 constexpr int INF_RD = LLC_WAY * HISTORY - 1;
 
 constexpr int INF_ETR = (LLC_WAY * HISTORY / GRANULARITY) - 1;
@@ -51,8 +57,8 @@ struct SampledLine {
 unordered_map<uint32_t, SampledLine* > sampledCache;
 
 uint32_t sampledSet(uint64_t full_addr) {
-    full_addr = full_addr >> 6;
-    full_addr = (full_addr << (64 - (SAMPLED_CACHE_SETS_LOG + 13))) >> (64 - (SAMPLED_CACHE_SETS_LOG + 13));
+    full_addr = full_addr >> LOG2_BLOCK_SIZE;
+    full_addr = (full_addr << (64 - (SAMPLED_CACHE_SETS_LOG + (int)log2(LLC_SET)))) >> (64 - (SAMPLED_CACHE_SETS_LOG + (int)log2(LLC_SET)));
     return full_addr;
 }
 
@@ -78,7 +84,7 @@ void CACHE::llc_initialize_replacement()
     }
     for(uint32_t set = 0; set < LLC_SET; set++) {
         if (SAMPLED_SET(set)) {
-            int modifier = 1 << 13;
+            int modifier = 1 << (int)log2(LLC_SET);
             int limit = 1 << SAMPLED_CACHE_SETS_LOG;
             for (int i = 0; i < limit; i++) {
                 sampledCache[set + modifier*i] = new SampledLine[SAMPLED_WAYS]();
@@ -98,20 +104,33 @@ uint64_t CRC_HASH( uint64_t _blockAddress )
 }
 
 uint64_t get_pc_signature(uint64_t pc, bool hit, bool prefetch, uint32_t core) {
-    pc = pc << 1;
-    if(prefetch) {
-        pc = pc | 1;
+    if (NUM_CPUS == 1) {
+        pc = pc << 1;
+        if(hit) {
+            pc = pc | 1;
+        }
+        pc = pc << 1;
+        if (prefetch) {
+            pc = pc | 1;                            
+        }
+        pc = CRC_HASH(pc);
+        pc = (pc << (64 - PC_HASH)) >> (64 - PC_HASH);
+    } else {
+        pc = pc << 1;
+        if(prefetch) {
+            pc = pc | 1;
+        }
+        pc = pc << 2;
+        pc = pc | core;
+        pc = CRC_HASH(pc);
+        pc = (pc << (64 - PC_HASH)) >> (64 - PC_HASH);
     }
-    pc = pc << 2;
-    pc = pc | core;
-    pc = CRC_HASH(pc);
-    pc = (pc << (64 - PC_HASH)) >> (64 - PC_HASH);
     return pc;
 }
 
 
 void block_addrHash(uint64_t& x) {
-    x >>= 19;
+    x >>= (int)log2(LLC_SET) + LOG2_BLOCK_SIZE + SAMPLED_CACHE_SETS_LOG;
     x = (x << (64 - BLOCK_ADDR_HASH)) >> (64 - BLOCK_ADDR_HASH);
 }
 
@@ -231,8 +250,9 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
             int sample = time_distance(current_timestamp[set], last_timestamp);
             if (sample <= INF_RD) {
                 if (type == PREFETCH) {
-                    sample = sample * FLEXMIN_PENALTY_NUM;
-                    sample = sample / FLEXMIN_PENALTY_DEN;
+                    //sample = sample * FLEXMIN_PENALTY_NUM;
+                    //sample = sample / FLEXMIN_PENALTY_DEN;
+                    sample = sample * FLEXMIN_PENALTY;
                 }
                 if (rdp.count(current_signature)) {
                     int init = rdp[current_signature];
@@ -319,8 +339,11 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     
     if (way < LLC_WAY) {
         if(!rdp.count(pc)) {
-            //etr[set][way] = 0;
-            etr[set][way] = INF_ETR;
+            if (NUM_CPUS == 1) {
+                etr[set][way] = 0;
+            } else {
+                etr[set][way] = INF_ETR;
+            }
         } else {
             if(rdp[pc] > MAX_RD) {
                 etr[set][way] = INF_ETR;
