@@ -9,49 +9,45 @@ constexpr int LOG2_LLC_SET = log2(LLC_SET);
 constexpr int LOG2_LLC_SIZE = LOG2_LLC_SET + log2(LLC_WAY) + LOG2_BLOCK_SIZE;
 constexpr int LOG2_SAMPLED_SETS = LOG2_LLC_SIZE - 16;
 
-bool SAMPLED_SET(int set) {
-    int mask_length = LOG2_LLC_SET-LOG2_SAMPLED_SETS;
-    int mask = (1 << mask_length) - 1;
-    return (set & mask) == ((set >> (LOG2_LLC_SET - mask_length)) & mask);
-}
+constexpr int HISTORY = 8;
+constexpr int GRANULARITY = 8;
 
 constexpr int SAMPLED_CACHE_WAYS = 5;
 constexpr int LOG2_SAMPLED_CACHE_SETS = 4;
-
-constexpr int TIMESTAMP_BITS = 8;
-
-
-constexpr int HISTORY = 8;
-constexpr int GRANULARITY = 8;
 constexpr int SAMPLED_CACHE_TAG_BITS = 31 - LOG2_LLC_SIZE;
 constexpr int PC_SIGNATURE_BITS = LOG2_LLC_SIZE - 10;
+constexpr int TIMESTAMP_BITS = 8;
 
 constexpr double TEMP_DIFFERENCE = 1.0/16.0;
 
 constexpr double FLEXMIN_PENALTY = 2.0 - log2(NUM_CPUS)/4.0;
 
 constexpr int INF_RD = LLC_WAY * HISTORY - 1;
-
 constexpr int INF_ETR = (LLC_WAY * HISTORY / GRANULARITY) - 1;
 constexpr int MAX_RD = INF_RD - 22;
-int etr_clock[LLC_SET];
 
 
 int etr[LLC_SET][LLC_WAY];
+int etr_clock[LLC_SET];
 
 unordered_map<uint32_t, int> rdp;
 
-
 int current_timestamp[LLC_SET];
 
-struct SampledLine {
-    uint64_t signature;
+struct SampledCacheLine {
     bool valid;
     uint64_t tag;
+    uint64_t signature;
     int timestamp;
 };
-unordered_map<uint32_t, SampledLine* > sampledCache;
+unordered_map<uint32_t, SampledCacheLine* > sampled_cache;
 
+
+bool is_sampled_set(int set) {
+    int mask_length = LOG2_LLC_SET-LOG2_SAMPLED_SETS;
+    int mask = (1 << mask_length) - 1;
+    return (set & mask) == ((set >> (LOG2_LLC_SET - mask_length)) & mask);
+}
 
 uint64_t CRC_HASH( uint64_t _blockAddress )
 {
@@ -98,9 +94,8 @@ void get_sampled_cache_tag(uint64_t& x) {
     x = (x << (64 - SAMPLED_CACHE_TAG_BITS)) >> (64 - SAMPLED_CACHE_TAG_BITS);
 }
 
-
 int search_sampled_cache(uint64_t blockAddress, uint32_t set) {
-    SampledLine* sampled_set = sampledCache[set];
+    SampledCacheLine* sampled_set = sampled_cache[set];
     for (int way = 0; way < SAMPLED_CACHE_WAYS; way++) {
         if (sampled_set[way].valid && (sampled_set[way].tag == blockAddress)) {
             return way;
@@ -110,7 +105,7 @@ int search_sampled_cache(uint64_t blockAddress, uint32_t set) {
 }
 
 void detrain(uint32_t set, int way) {
-    SampledLine temp = sampledCache[set][way];
+    SampledCacheLine temp = sampled_cache[set][way];
     if (!temp.valid) {
         return;
     }
@@ -123,9 +118,8 @@ void detrain(uint32_t set, int way) {
     } else {
         rdp[temp.signature] = INF_RD;
     }
-    sampledCache[set][way].valid = false;
+    sampled_cache[set][way].valid = false;
 }
-
 
 
 /* initialize cache replacement state */
@@ -137,11 +131,11 @@ void CACHE::llc_initialize_replacement()
         current_timestamp[i] = 0;
     }
     for(uint32_t set = 0; set < LLC_SET; set++) {
-        if (SAMPLED_SET(set)) {
+        if (is_sampled_set(set)) {
             int modifier = 1 << LOG2_LLC_SET;
             int limit = 1 << LOG2_SAMPLED_CACHE_SETS;
             for (int i = 0; i < limit; i++) {
-                sampledCache[set + modifier*i] = new SampledLine[SAMPLED_CACHE_WAYS]();
+                sampled_cache[set + modifier*i] = new SampledCacheLine[SAMPLED_CACHE_WAYS]();
             }
         }
     }
@@ -185,6 +179,7 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
     return maxWay;
 }
 
+
 int temporal_difference(int init, int sample) {
     if (sample == init) {
         return init;
@@ -209,7 +204,7 @@ int increment_timestamp(int input) {
     return input;
 }
 
-int time_distance(int global, int local) {
+int time_elapsed(int global, int local) {
     if (global >= local) {
         return global - local;
     }
@@ -237,13 +232,13 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     pc = get_pc_signature(pc, hit, type == PREFETCH, cpu);
 
 
-    if (SAMPLED_SET(set)) {
+    if (is_sampled_set(set)) {
         int lastAccessWay = search_sampled_cache(block_addr, sampled_set);
         if (lastAccessWay > -1) {
-            uint64_t current_signature = sampledCache[sampled_set][lastAccessWay].signature;
-            uint64_t last_timestamp = sampledCache[sampled_set][lastAccessWay].timestamp;
+            uint64_t current_signature = sampled_cache[sampled_set][lastAccessWay].signature;
+            uint64_t last_timestamp = sampled_cache[sampled_set][lastAccessWay].timestamp;
             //int sample = timeStamp[set] - current_timeStamp;
-            int sample = time_distance(current_timestamp[set], last_timestamp);
+            int sample = time_elapsed(current_timestamp[set], last_timestamp);
             if (sample <= INF_RD) {
                 if (type == PREFETCH) {
                     sample = sample * FLEXMIN_PENALTY;
@@ -264,10 +259,10 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         }
 
         for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-            if (sampledCache[sampled_set][w].valid) {
-                uint64_t last_timestamp = sampledCache[sampled_set][w].timestamp;
+            if (sampled_cache[sampled_set][w].valid) {
+                uint64_t last_timestamp = sampled_cache[sampled_set][w].timestamp;
                 //int sample = timeStamp[set] - current_timeStamp;
-                int sample = time_distance(current_timestamp[set], last_timestamp);
+                int sample = time_elapsed(current_timestamp[set], last_timestamp);
                 if (sample > INF_RD) {
                     detrain(sampled_set, w);
                 }
@@ -275,8 +270,8 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         }
 
         for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-            if (sampledCache[sampled_set][w].valid && sampledCache[sampled_set][w].tag == block_addr) {
-                sampledCache[sampled_set][w].valid = false;
+            if (sampled_cache[sampled_set][w].valid && sampled_cache[sampled_set][w].tag == block_addr) {
+                sampled_cache[sampled_set][w].valid = false;
                 break;
             }
         }
@@ -284,7 +279,7 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 
         bool space = false;
         for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-            if (sampledCache[sampled_set][w].valid == false) {
+            if (sampled_cache[sampled_set][w].valid == false) {
                 space = true;
                 break;
             }
@@ -294,9 +289,9 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
             int LRU_way = -1;
             int LRU = -1;
             for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-                uint64_t last_timestamp = sampledCache[sampled_set][w].timestamp;
+                uint64_t last_timestamp = sampled_cache[sampled_set][w].timestamp;
                 //int sample = timeStamp[set] - current_timeStamp;
-                int sample = time_distance(current_timestamp[set], last_timestamp);
+                int sample = time_elapsed(current_timestamp[set], last_timestamp);
                 if (sample > LRU) {
                     LRU = sample;
                     LRU_way  = w;
@@ -306,11 +301,11 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         }
 
         for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-            if (sampledCache[sampled_set][w].valid == false) {
-                sampledCache[sampled_set][w].valid = true;
-                sampledCache[sampled_set][w].signature = pc;
-                sampledCache[sampled_set][w].tag = block_addr;
-                sampledCache[sampled_set][w].timestamp = current_timestamp[set];
+            if (sampled_cache[sampled_set][w].valid == false) {
+                sampled_cache[sampled_set][w].valid = true;
+                sampled_cache[sampled_set][w].signature = pc;
+                sampled_cache[sampled_set][w].tag = block_addr;
+                sampled_cache[sampled_set][w].timestamp = current_timestamp[set];
                 break;
             }
         }
@@ -348,6 +343,7 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     }   
     
 }
+
 
 /* called at the end of the simulation */
 void CACHE::llc_replacement_final_stats()
