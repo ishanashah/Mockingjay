@@ -1,7 +1,6 @@
 #include "cache.h"
 #include "ooo_cpu.h"
 #include <unordered_map>
-#include <vector>
 #include <stdlib.h>
 using namespace std;
 
@@ -12,6 +11,10 @@ constexpr int LOG2_SAMPLED_SETS = LOG2_LLC_SIZE - 16;
 constexpr int HISTORY = 8;
 constexpr int GRANULARITY = 8;
 
+constexpr int INF_RD = LLC_WAY * HISTORY - 1;
+constexpr int INF_ETR = (LLC_WAY * HISTORY / GRANULARITY) - 1;
+constexpr int MAX_RD = INF_RD - 22;
+
 constexpr int SAMPLED_CACHE_WAYS = 5;
 constexpr int LOG2_SAMPLED_CACHE_SETS = 4;
 constexpr int SAMPLED_CACHE_TAG_BITS = 31 - LOG2_LLC_SIZE;
@@ -19,12 +22,7 @@ constexpr int PC_SIGNATURE_BITS = LOG2_LLC_SIZE - 10;
 constexpr int TIMESTAMP_BITS = 8;
 
 constexpr double TEMP_DIFFERENCE = 1.0/16.0;
-
 constexpr double FLEXMIN_PENALTY = 2.0 - log2(NUM_CPUS)/4.0;
-
-constexpr int INF_RD = LLC_WAY * HISTORY - 1;
-constexpr int INF_ETR = (LLC_WAY * HISTORY / GRANULARITY) - 1;
-constexpr int MAX_RD = INF_RD - 22;
 
 
 int etr[LLC_SET][LLC_WAY];
@@ -89,9 +87,10 @@ uint32_t get_sampled_cache_index(uint64_t full_addr) {
     return full_addr;
 }
 
-void get_sampled_cache_tag(uint64_t& x) {
+uint64_t get_sampled_cache_tag(uint64_t x) {
     x >>= LOG2_LLC_SET + LOG2_BLOCK_SIZE + LOG2_SAMPLED_CACHE_SETS;
     x = (x << (64 - SAMPLED_CACHE_TAG_BITS)) >> (64 - SAMPLED_CACHE_TAG_BITS);
+    return x;
 }
 
 int search_sampled_cache(uint64_t blockAddress, uint32_t set) {
@@ -111,10 +110,7 @@ void detrain(uint32_t set, int way) {
     }
 
     if (rdp.count(temp.signature)) {
-        rdp[temp.signature]++;
-        if (rdp[temp.signature] > INF_RD) {
-            rdp[temp.signature] = INF_RD;
-        }
+        rdp[temp.signature] = min(rdp[temp.signature] + 1, INF_RD);
     } else {
         rdp[temp.signature] = INF_RD;
     }
@@ -127,7 +123,7 @@ void CACHE::llc_initialize_replacement()
 {
     // put your own initialization code here
     for(int i = 0; i < LLC_SET; i++) {
-        etr_clock[i] = 0;
+        etr_clock[i] = GRANULARITY;
         current_timestamp[i] = 0;
     }
     for(uint32_t set = 0; set < LLC_SET; set++) {
@@ -139,7 +135,6 @@ void CACHE::llc_initialize_replacement()
             }
         }
     }
-
 }
 
 
@@ -158,44 +153,41 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
 
 
     // your eviction policy goes here
-    pc = get_pc_signature(pc, false, type == PREFETCH, cpu);
-    int maxRereference = 0;
-    int maxWay = 0;
-    
+    int max_etr = 0;
+    int victim_way = 0;
     for (int way = 0; way < LLC_WAY; way++) {
-        if (abs(etr[set][way]) > maxRereference ||
-                (abs(etr[set][way]) == maxRereference &&
+        if (abs(etr[set][way]) > max_etr ||
+                (abs(etr[set][way]) == max_etr &&
                         etr[set][way] < 0)) {
-            maxRereference = abs(etr[set][way]);
-            maxWay = way;
+            max_etr = abs(etr[set][way]);
+            victim_way = way;
         }
     }
     
-    if (type != WRITEBACK && rdp.count(pc) &&
-            (rdp[pc] > MAX_RD || rdp[pc] / GRANULARITY > maxRereference)) {
+    uint64_t pc_signature = get_pc_signature(pc, false, type == PREFETCH, cpu);
+    if (type != WRITEBACK && rdp.count(pc_signature) &&
+            (rdp[pc_signature] > MAX_RD || rdp[pc_signature] / GRANULARITY > max_etr)) {
         return LLC_WAY;
     }
     
-    return maxWay;
+    return victim_way;
 }
 
 
 int temporal_difference(int init, int sample) {
-    if (sample == init) {
-        return init;
-    }
     if (sample > init) {
         int diff = sample - init;
         diff = diff * TEMP_DIFFERENCE;
         diff = min(1, diff);
-        return init + diff;
-    }
-    if (sample < init) {
+        return min(init + diff, INF_RD);
+    } else if (sample < init) {
         int diff = init - sample;
         diff = diff * TEMP_DIFFERENCE;
         diff = min(1, diff);
-        return init - diff;
-    }    
+        return max(init - diff, 0);
+    } else {
+        return init;
+    }
 }
 
 int increment_timestamp(int input) {
@@ -216,114 +208,87 @@ int time_elapsed(int global, int local) {
 /* called on every cache hit and cache fill */
 void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t pc, uint64_t victim_addr, uint32_t type, uint8_t hit)
 {
-    // don't modify this code or put anythin above it;
     if (type == WRITEBACK) {
         if(!hit) {
             etr[set][way] = -INF_ETR;
         }
         return;
     }
-    uint32_t sampled_set = get_sampled_cache_index(full_addr);
         
 
-    // your code goes here
-    uint64_t block_addr = full_addr;
-    get_sampled_cache_tag(block_addr);
     pc = get_pc_signature(pc, hit, type == PREFETCH, cpu);
 
 
     if (is_sampled_set(set)) {
-        int lastAccessWay = search_sampled_cache(block_addr, sampled_set);
-        if (lastAccessWay > -1) {
-            uint64_t current_signature = sampled_cache[sampled_set][lastAccessWay].signature;
-            uint64_t last_timestamp = sampled_cache[sampled_set][lastAccessWay].timestamp;
-            //int sample = timeStamp[set] - current_timeStamp;
+        uint32_t sampled_cache_index = get_sampled_cache_index(full_addr);
+        uint64_t sampled_cache_tag = get_sampled_cache_tag(full_addr);
+        int sampled_cache_way = search_sampled_cache(sampled_cache_tag, sampled_cache_index);
+
+        if (sampled_cache_way > -1) {
+            uint64_t last_signature = sampled_cache[sampled_cache_index][sampled_cache_way].signature;
+            uint64_t last_timestamp = sampled_cache[sampled_cache_index][sampled_cache_way].timestamp;
             int sample = time_elapsed(current_timestamp[set], last_timestamp);
+
             if (sample <= INF_RD) {
                 if (type == PREFETCH) {
                     sample = sample * FLEXMIN_PENALTY;
                 }
-                if (rdp.count(current_signature)) {
-                    int init = rdp[current_signature];
-                    rdp[current_signature] = temporal_difference(init, sample);
+                if (rdp.count(last_signature)) {
+                    int init = rdp[last_signature];
+                    rdp[last_signature] = temporal_difference(init, sample);
                 } else {
-                    rdp[current_signature] = sample;
+                    rdp[last_signature] = sample;
                 }
-                if (rdp[current_signature] < 0) {
-                    rdp[current_signature] = 0;
-                } 
-                if (rdp[current_signature] > INF_RD) {
-                    rdp[current_signature] = INF_RD;
-                }
+
+                sampled_cache[sampled_cache_index][sampled_cache_way].valid = false;
             }
         }
+
+
+        int lru_way = -1;
+        int lru_rd = -1;
+        for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
+            if (sampled_cache[sampled_cache_index][w].valid == false) {
+                lru_way = w;
+                lru_rd = INF_RD + 1;
+                continue;
+            }
+
+            uint64_t last_timestamp = sampled_cache[sampled_cache_index][w].timestamp;
+            int sample = time_elapsed(current_timestamp[set], last_timestamp);
+            if (sample > INF_RD) {
+                lru_way = w;
+                lru_rd = INF_RD + 1;
+                detrain(sampled_cache_index, w);
+            } else if (sample > lru_rd) {
+                lru_way = w;
+                lru_rd = sample;
+            }
+        }
+        detrain(sampled_cache_index, lru_way);
 
         for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-            if (sampled_cache[sampled_set][w].valid) {
-                uint64_t last_timestamp = sampled_cache[sampled_set][w].timestamp;
-                //int sample = timeStamp[set] - current_timeStamp;
-                int sample = time_elapsed(current_timestamp[set], last_timestamp);
-                if (sample > INF_RD) {
-                    detrain(sampled_set, w);
-                }
-            }
-        }
-
-        for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-            if (sampled_cache[sampled_set][w].valid && sampled_cache[sampled_set][w].tag == block_addr) {
-                sampled_cache[sampled_set][w].valid = false;
-                break;
-            }
-        }
-
-
-        bool space = false;
-        for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-            if (sampled_cache[sampled_set][w].valid == false) {
-                space = true;
-                break;
-            }
-        }
-
-        if (!space) {
-            int LRU_way = -1;
-            int LRU = -1;
-            for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-                uint64_t last_timestamp = sampled_cache[sampled_set][w].timestamp;
-                //int sample = timeStamp[set] - current_timeStamp;
-                int sample = time_elapsed(current_timestamp[set], last_timestamp);
-                if (sample > LRU) {
-                    LRU = sample;
-                    LRU_way  = w;
-                }
-            }
-            detrain(sampled_set, LRU_way);
-        }
-
-        for (int w = 0; w < SAMPLED_CACHE_WAYS; w++) {
-            if (sampled_cache[sampled_set][w].valid == false) {
-                sampled_cache[sampled_set][w].valid = true;
-                sampled_cache[sampled_set][w].signature = pc;
-                sampled_cache[sampled_set][w].tag = block_addr;
-                sampled_cache[sampled_set][w].timestamp = current_timestamp[set];
+            if (sampled_cache[sampled_cache_index][w].valid == false) {
+                sampled_cache[sampled_cache_index][w].valid = true;
+                sampled_cache[sampled_cache_index][w].signature = pc;
+                sampled_cache[sampled_cache_index][w].tag = sampled_cache_tag;
+                sampled_cache[sampled_cache_index][w].timestamp = current_timestamp[set];
                 break;
             }
         }
         
         current_timestamp[set] = increment_timestamp(current_timestamp[set]);
-
     }
-    if(etr_clock[set] == 0) {
+
+    if(etr_clock[set] == GRANULARITY) {
         for (int w = 0; w < LLC_WAY; w++) {
             if ((uint32_t) w != way && abs(etr[set][w]) < INF_ETR) {
                 etr[set][w]--;
             }
         }
-    }
-    etr_clock[set]++;
-    if(etr_clock[set] == GRANULARITY) {
         etr_clock[set] = 0;
     }
+    etr_clock[set]++;
     
     
     if (way < LLC_WAY) {
@@ -340,8 +305,7 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
                 etr[set][way] = rdp[pc] / GRANULARITY;
             }
         }
-    }   
-    
+    }
 }
 
 
